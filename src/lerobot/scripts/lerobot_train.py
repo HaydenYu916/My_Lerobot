@@ -22,6 +22,7 @@ from typing import Any
 
 import torch
 from accelerate import Accelerator
+from accelerate.utils import broadcast
 from termcolor import colored
 from torch.optim import Optimizer
 
@@ -394,6 +395,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    # Early stopping state (metric = train loss, lower is better)
+    best_loss: float | None = None
+    log_intervals_no_improve = 0
+    if cfg.early_stopping:
+        early_stop_tensor = torch.tensor([0], device=accelerator.device, dtype=torch.long)
+        if is_main_process and cfg.log_freq <= 0:
+            logging.warning("early_stopping is True but log_freq <= 0; early stopping will never trigger.")
+    else:
+        early_stop_tensor = None
+
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -420,6 +431,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
+            # Early stopping: check if train loss improved (only on main process)
+            if cfg.early_stopping and early_stop_tensor is not None:
+                current_loss = train_tracker.metrics["loss"].avg
+                if best_loss is None or current_loss < (best_loss - cfg.early_stopping_min_delta):
+                    best_loss = current_loss
+                    log_intervals_no_improve = 0
+                else:
+                    log_intervals_no_improve += 1
+                if log_intervals_no_improve >= cfg.early_stopping_patience:
+                    early_stop_tensor[0] = 1
+                    logging.info(
+                        f"Early stopping at step {step} (no improvement for {cfg.early_stopping_patience} log intervals, best_loss={best_loss:.4f})"
+                    )
             logging.info(train_tracker)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
@@ -437,6 +461,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        # Sync early stop signal across processes and exit loop if triggered
+        if (
+            cfg.early_stopping
+            and early_stop_tensor is not None
+            and cfg.log_freq > 0
+            and step % cfg.log_freq == 0
+        ):
+            early_stop_tensor = broadcast(early_stop_tensor, from_process=0)
+            if early_stop_tensor.item() == 1:
+                if is_main_process:
+                    logging.info("Early stopping triggered, ending training.")
+                break
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

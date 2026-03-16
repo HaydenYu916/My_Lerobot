@@ -76,6 +76,12 @@ class TrainPipelineConfig(HubMixin):
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+
+    # Early stopping: stop when metric does not improve for `early_stopping_patience` consecutive log intervals
+    early_stopping: bool = False
+    early_stopping_patience: int = 10  # number of log intervals without improvement before stopping
+    early_stopping_min_delta: float = 1e-4  # minimum change to count as improvement (for loss: lower is better)
+
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:
